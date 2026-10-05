@@ -1,0 +1,11 @@
+_target_: classae.sae.standard.StandardSAEConfig
+activation_dim: 768
+dict_size: 16384
+lr: 6e-4
+decay_start: 5000
+dead_feature_threshold: 2_000_000
+sparsity_warmup_steps: 300
+l1_penalty: 0.025
+
+wandb_name: "standard_${seed}_${sae.dict_size}"
+save_dir: "checkpoints/clip_16384/${sae.wandb_name}"

@@ -1,0 +1,14 @@
+_target_: classae.sae.classae.ClasSAEConfig
+activation_dim: 768
+dict_size: 16384
+k: 380
+lr: 6e-4
+soft_topk_alpha: 0.001
+decay_start: 5000
+agreement_loss_weight: 0.2
+dead_feature_threshold: 2_000_000
+agreement_tau: 1.0
+rho: 40
+
+wandb_name: "classae_${seed}_${sae.dict_size}"
+save_dir: "checkpoints/clip_16384/${sae.wandb_name}"

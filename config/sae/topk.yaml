@@ -1,0 +1,10 @@
+_target_: classae.sae.topk.TopKSAEConfig
+activation_dim: 768
+k: 380
+dict_size: 16384
+lr: 6e-4
+decay_start: 5000
+dead_feature_threshold: 2_000_000
+
+wandb_name: "topk_${seed}_${sae.dict_size}"
+save_dir: "checkpoints/clip_16384/${sae.wandb_name}"

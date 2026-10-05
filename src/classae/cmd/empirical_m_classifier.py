@@ -1,0 +1,658 @@
+import argparse
+import json
+from pathlib import Path
+
+import torch
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+from classae.const import SUPPORTED_ARCHITECTURES, is_class_aligned
+from classae.dataset import ActivationsDataset
+from classae.eval.posthoc_M import build_posthoc_M
+
+
+@torch.inference_mode()
+def evaluate_classifier(
+    model,
+    activations_path: str,
+    M: torch.Tensor,
+    batch_size: int,
+    num_workers: int,
+    device: torch.device,
+    num_classes: int,
+    max_examples: int | None = None,
+):
+    dataset = ActivationsDataset(activations_path)
+
+    if max_examples is not None:
+        max_examples = min(max_examples, len(dataset))
+        dataset = torch.utils.data.Subset(
+            dataset,
+            range(max_examples),
+        )
+
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=device.type == "cuda",
+    )
+
+    c = num_classes
+    d = model.dict_size
+
+    # --------------------------------------------------------------
+    # Accumulators
+    # --------------------------------------------------------------
+
+    total_examples = 0
+
+    correct = 0
+    correct_top5 = 0
+    correct_top10 = 0
+
+    confusion = torch.zeros(
+        (c, c),
+        dtype=torch.long,
+        device=device,
+    )
+
+    true_score_sum = torch.tensor(
+        0.0,
+        dtype=torch.float64,
+        device=device,
+    )
+
+    wrong_score_sum = torch.tensor(
+        0.0,
+        dtype=torch.float64,
+        device=device,
+    )
+
+    margin_sum = torch.tensor(
+        0.0,
+        dtype=torch.float64,
+        device=device,
+    )
+
+    # --------------------------------------------------------------
+    # Evaluation
+    # --------------------------------------------------------------
+
+    for batch in tqdm(loader):
+        x, labels = batch
+
+        x = x.to(
+            device,
+            non_blocking=True,
+        )
+
+        labels = labels.to(
+            device,
+            non_blocking=True,
+        ).long()
+
+        batch_size_actual = x.shape[0]
+
+        # ----------------------------------------------------------
+        # SAE hard Top-k selection
+        # ----------------------------------------------------------
+
+        encoded_acts = model.encode(x)
+        k_hat = (encoded_acts > 0).float().sum(dim=-1)
+
+        selected = encoded_acts > 0
+
+        # ----------------------------------------------------------
+        # pi(x)
+        #
+        # Each selected feature contributes exactly 1/k.
+        # ----------------------------------------------------------
+
+        pi = selected.to(torch.float32) / k_hat.unsqueeze(1).float()
+
+        # ----------------------------------------------------------
+        # Class scores
+        #
+        # scores[b, c] = sum_i pi[b, i] * M[i, c]
+        # ----------------------------------------------------------
+
+        scores = pi @ M.to(torch.float32)
+
+        predictions = scores.argmax(dim=1)
+
+        # ----------------------------------------------------------
+        # Top-k predictions
+        # ----------------------------------------------------------
+
+        topk_max = min(10, c)
+
+        top_predictions = scores.topk(
+            k=topk_max,
+            dim=1,
+        ).indices
+
+        correct_mask = predictions == labels
+
+        correct += correct_mask.sum().item()
+
+        if c >= 5:
+            correct_top5 += (
+                (top_predictions[:, :5] == labels.unsqueeze(1)).any(dim=1).sum().item()
+            )
+        else:
+            correct_top5 += correct_mask.sum().item()
+
+        if c >= 10:
+            correct_top10 += (
+                (top_predictions[:, :10] == labels.unsqueeze(1)).any(dim=1).sum().item()
+            )
+        else:
+            correct_top10 += correct_mask.sum().item()
+
+        # ----------------------------------------------------------
+        # Confusion matrix
+        # ----------------------------------------------------------
+
+        flat_indices = labels * c + predictions
+
+        batch_confusion = torch.bincount(
+            flat_indices,
+            minlength=c * c,
+        ).reshape(c, c)
+
+        confusion += batch_confusion
+
+        # ----------------------------------------------------------
+        # Score / margin statistics
+        # ----------------------------------------------------------
+
+        row_indices = torch.arange(
+            batch_size_actual,
+            device=device,
+        )
+
+        true_scores = scores[
+            row_indices,
+            labels,
+        ]
+
+        true_class_mask = torch.zeros_like(
+            scores,
+            dtype=torch.bool,
+        )
+
+        true_class_mask[
+            row_indices,
+            labels,
+        ] = True
+
+        scores_without_true = scores.masked_fill(
+            true_class_mask,
+            float("-inf"),
+        )
+
+        max_wrong_scores = scores_without_true.max(
+            dim=1,
+        ).values
+
+        margins = true_scores - max_wrong_scores
+
+        true_score_sum += true_scores.double().sum()
+        wrong_score_sum += max_wrong_scores.double().sum()
+        margin_sum += margins.double().sum()
+
+        total_examples += batch_size_actual
+
+    # --------------------------------------------------------------
+    # Classification metrics
+    # --------------------------------------------------------------
+
+    tp = confusion.diag().double()
+
+    predicted_count = confusion.sum(dim=0).double()
+    true_count = confusion.sum(dim=1).double()
+
+    precision_per_class = torch.where(
+        predicted_count > 0,
+        tp / predicted_count.clamp_min(1),
+        torch.zeros_like(tp),
+    )
+
+    recall_per_class = torch.where(
+        true_count > 0,
+        tp / true_count.clamp_min(1),
+        torch.zeros_like(tp),
+    )
+
+    f1_per_class = torch.where(
+        (precision_per_class + recall_per_class) > 0,
+        2
+        * precision_per_class
+        * recall_per_class
+        / (precision_per_class + recall_per_class).clamp_min(1e-12),
+        torch.zeros_like(tp),
+    )
+
+    valid_classes = true_count > 0
+
+    macro_precision = precision_per_class[valid_classes].mean()
+    macro_recall = recall_per_class[valid_classes].mean()
+    macro_f1 = f1_per_class[valid_classes].mean()
+
+    weighted_precision = (
+        precision_per_class * true_count
+    ).sum() / true_count.sum().clamp_min(1)
+
+    weighted_recall = (
+        recall_per_class * true_count
+    ).sum() / true_count.sum().clamp_min(1)
+
+    weighted_f1 = (f1_per_class * true_count).sum() / true_count.sum().clamp_min(1)
+
+    accuracy = correct / total_examples
+    top5_accuracy = correct_top5 / total_examples
+    top10_accuracy = correct_top10 / total_examples
+
+    mean_true_score = (true_score_sum / total_examples).item()
+
+    mean_wrong_score = (wrong_score_sum / total_examples).item()
+
+    mean_margin = (margin_sum / total_examples).item()
+
+    return {
+        "num_examples": total_examples,
+        "accuracy": accuracy,
+        "top5_accuracy": top5_accuracy,
+        "top10_accuracy": top10_accuracy,
+        "macro_precision": macro_precision.item(),
+        "macro_recall": macro_recall.item(),
+        "macro_f1": macro_f1.item(),
+        "weighted_precision": weighted_precision.item(),
+        "weighted_recall": weighted_recall.item(),
+        "weighted_f1": weighted_f1.item(),
+        "mean_true_class_score": mean_true_score,
+        "mean_max_wrong_class_score": mean_wrong_score,
+        "mean_classification_margin": mean_margin,
+        "confusion_matrix": confusion.cpu().tolist(),
+        "precision_per_class": precision_per_class.cpu().tolist(),
+        "recall_per_class": recall_per_class.cpu().tolist(),
+        "f1_per_class": f1_per_class.cpu().tolist(),
+        "support_per_class": true_count.cpu().long().tolist(),
+        "predicted_per_class": predicted_count.cpu().long().tolist(),
+    }
+
+
+@torch.inference_mode()
+def main(
+    architecture: str,
+    checkpoint_path: str,
+    test_activations_path: str,
+    precomputed_train_matrix: str | None = None,
+    output_path: str | None = None,
+    rho: float = 5.0,
+    num_classes: int = 1000,
+    batch_size: int = 4096,
+    num_workers: int = 4,
+    device: str | None = None,
+    max_test_examples: int | None = None,
+):
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    device = torch.device(device)
+
+    # ------------------------------------------------------------------
+    # Load model
+    # ------------------------------------------------------------------
+
+    model = SUPPORTED_ARCHITECTURES[architecture].from_pretrained(
+        checkpoint_path,
+        device=device,
+    )
+
+    model.eval()
+
+    d = model.dict_size
+    c = num_classes
+
+    # ------------------------------------------------------------------
+    # Compute empirical matrix on TRAIN data
+    # ------------------------------------------------------------------
+
+    print("\nComputing empirical feature-class matrix " "on training data...")
+
+    if is_class_aligned(model) and precomputed_train_matrix is None:
+        print("Using built in M matrix")
+        train_A = model.class_matrix
+        M = model.calculate_M()
+        k = torch.softmax(model.budget_vector, dim=0) * model.rho * d
+    else:
+        print(
+            f"Loading precomputed empirical feature-class matrix from: {precomputed_train_matrix}"
+        )
+        train_A = torch.load(precomputed_train_matrix).to(device)
+
+        # ------------------------------------------------------------------
+        # Construct post-hoc matrix
+        # ------------------------------------------------------------------
+
+        print("Constructing post-hoc feature-class matrix...")
+        M, k = build_posthoc_M(train_A, rho=rho)
+
+    # ------------------------------------------------------------------
+    # Evaluate on TEST data
+    # ------------------------------------------------------------------
+
+    print("Evaluating free classifier on test data...")
+
+    eval_results = evaluate_classifier(
+        model=model,
+        activations_path=test_activations_path,
+        M=M,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        device=device,
+        num_classes=num_classes,
+        max_examples=max_test_examples,
+    )
+
+    # ------------------------------------------------------------------
+    # Budget statistics
+    # ------------------------------------------------------------------
+
+    num_zero_budget = int((k == 0).sum().item())
+
+    num_annotated = d - num_zero_budget
+
+    fraction_zero_budget = num_zero_budget / d
+
+    fraction_annotated = num_annotated / d
+
+    # ------------------------------------------------------------------
+    # Per-feature information
+    # ------------------------------------------------------------------
+
+    train_cpu = train_A.cpu()
+    M_cpu = M.cpu()
+    k_cpu = k.cpu()
+
+    per_feature = []
+
+    for i in range(d):
+        ki = int(k_cpu[i].item())
+
+        if ki > 0:
+            claimed_classes = torch.topk(
+                M_cpu[i],
+                k=min(ki, c),
+            ).indices.tolist()
+        else:
+            claimed_classes = []
+
+        # Useful diagnostic:
+        #
+        # The empirical probability mass assigned to the claimed
+        # classes in the training matrix.
+        if ki > 0:
+            train_claimed_mass = float(train_cpu[i, claimed_classes].sum())
+        else:
+            train_claimed_mass = 0.0
+
+        per_feature.append(
+            {
+                "feature": i,
+                "budget": ki,
+                "train_claimed_mass": train_claimed_mass,
+                "claimed_classes": claimed_classes,
+            }
+        )
+
+    # ------------------------------------------------------------------
+    # Combine results
+    # ------------------------------------------------------------------
+
+    results = {
+        "architecture": architecture,
+        "rho": rho,
+        "num_test_examples": eval_results["num_examples"],
+        "num_features": d,
+        "num_classes": c,
+        "total_association_budget": d * rho,
+        "mean_feature_budget": float(k.mean()),
+        "min_feature_budget": float(k.min()),
+        "max_feature_budget": float(k.max()),
+        "num_zero_budget_features": num_zero_budget,
+        "fraction_zero_budget_features": fraction_zero_budget,
+        "num_annotated_features": num_annotated,
+        "fraction_annotated_features": fraction_annotated,
+        # --------------------------------------------------------------
+        # Classification metrics
+        # --------------------------------------------------------------
+        "accuracy": eval_results["accuracy"],
+        "top5_accuracy": eval_results["top5_accuracy"],
+        "top10_accuracy": eval_results["top10_accuracy"],
+        "macro_precision": eval_results["macro_precision"],
+        "macro_recall": eval_results["macro_recall"],
+        "macro_f1": eval_results["macro_f1"],
+        "weighted_precision": eval_results["weighted_precision"],
+        "weighted_recall": eval_results["weighted_recall"],
+        "weighted_f1": eval_results["weighted_f1"],
+        "mean_true_class_score": eval_results["mean_true_class_score"],
+        "mean_max_wrong_class_score": eval_results["mean_max_wrong_class_score"],
+        "mean_classification_margin": eval_results["mean_classification_margin"],
+        # --------------------------------------------------------------
+        # Classification diagnostics
+        # --------------------------------------------------------------
+        "classes": [
+            {
+                "class": class_idx,
+                "precision": eval_results["precision_per_class"][class_idx],
+                "recall": eval_results["recall_per_class"][class_idx],
+                "f1": eval_results["f1_per_class"][class_idx],
+                "support": eval_results["support_per_class"][class_idx],
+                "predicted": eval_results["predicted_per_class"][class_idx],
+            }
+            for class_idx in range(c)
+        ],
+        "confusion_matrix": eval_results["confusion_matrix"],
+        # --------------------------------------------------------------
+        # Feature-level post-hoc matrix
+        # --------------------------------------------------------------
+        "features": per_feature,
+    }
+
+    # ------------------------------------------------------------------
+    # Print summary
+    # ------------------------------------------------------------------
+
+    print("\n=== Ad-hoc Matrix Free Classifier Evaluation ===")
+
+    print(f"Architecture:              {architecture}")
+    print(f"rho:                       {rho}")
+    print(f"Test examples:             " f"{eval_results['num_examples']:,}")
+    print(f"Features:                  {d:,}")
+    print(f"Classes:                   {c:,}")
+    print(f"Total association K:       {d * rho:,}")
+
+    print()
+    print(f"Mean feature budget:       " f"{k.mean().item():.3f}")
+    print(f"Min feature budget:        " f"{k.min().item():.3f}")
+    print(f"Max feature budget:        " f"{k.max().item():.3f}")
+
+    print(
+        f"Zero-budget features:      "
+        f"{num_zero_budget:,} "
+        f"({100 * fraction_zero_budget:.2f}%)"
+    )
+
+    print(
+        f"Annotated features:        "
+        f"{num_annotated:,} "
+        f"({100 * fraction_annotated:.2f}%)"
+    )
+
+    print()
+
+    print(f"Accuracy:                  " f"{results['accuracy']:.4f}")
+
+    print(f"Top-5 accuracy:            " f"{results['top5_accuracy']:.4f}")
+
+    print(f"Top-10 accuracy:           " f"{results['top10_accuracy']:.4f}")
+
+    print()
+
+    print(f"Macro precision:           " f"{results['macro_precision']:.4f}")
+
+    print(f"Macro recall:              " f"{results['macro_recall']:.4f}")
+
+    print(f"Macro F1:                  " f"{results['macro_f1']:.4f}")
+
+    print()
+
+    print(f"Weighted precision:        " f"{results['weighted_precision']:.4f}")
+
+    print(f"Weighted recall:           " f"{results['weighted_recall']:.4f}")
+
+    print(f"Weighted F1:               " f"{results['weighted_f1']:.4f}")
+
+    print()
+
+    print(f"Mean true-class score:     " f"{results['mean_true_class_score']:.4f}")
+
+    print(
+        f"Mean max wrong-class score:" f" {results['mean_max_wrong_class_score']:.4f}"
+    )
+
+    print(
+        f"Mean classification margin:" f" {results['mean_classification_margin']:.4f}"
+    )
+
+    # ------------------------------------------------------------------
+    # Save results
+    # ------------------------------------------------------------------
+
+    if output_path is not None:
+        output_path = Path(output_path)
+
+        output_path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        with open(output_path, "w") as f:
+            json.dump(
+                results,
+                f,
+                indent=2,
+            )
+
+        print(f"\nSaved results to {output_path}")
+
+    return results
+
+
+def cli():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Evaluate a zero-shot/free classifier induced "
+            "by an ad-hoc feature-class matrix."
+        )
+    )
+
+    parser.add_argument(
+        "--architecture",
+        "-a",
+        type=str,
+        required=True,
+        choices=list(SUPPORTED_ARCHITECTURES.keys()),
+        help="Architecture of the trained SAE.",
+    )
+
+    parser.add_argument(
+        "--checkpoint-path",
+        type=str,
+        required=True,
+        help="Path to the trained SAE checkpoint.",
+    )
+
+    parser.add_argument(
+        "--precomputed-matrix",
+        type=str,
+        default=None,
+        help="Path to the precomputed empirical feature-class training matrix",
+    )
+    parser.add_argument(
+        "--test-activations-path",
+        type=str,
+        required=True,
+        help=("Path to the held-out/test " "ActivationsDataset directory."),
+    )
+
+    parser.add_argument(
+        "--output-path",
+        type=str,
+        default=None,
+        help="Optional JSON output path.",
+    )
+
+    parser.add_argument(
+        "--rho",
+        type=float,
+        default=5.0,
+        help=("Average number of class associations " "per feature. Defaults to 5."),
+    )
+
+    parser.add_argument(
+        "--num-classes",
+        type=int,
+        default=1000,
+        help="Number of classes.",
+    )
+
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=4096,
+    )
+
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=4,
+    )
+
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help=("cuda, cuda:0, cpu, etc. Defaults to " "CUDA if available."),
+    )
+
+    parser.add_argument(
+        "--max-test-examples",
+        type=int,
+        default=None,
+        help=("Optionally evaluate only the first N " "test examples."),
+    )
+
+    args = parser.parse_args()
+
+    main(
+        architecture=args.architecture,
+        checkpoint_path=args.checkpoint_path,
+        precomputed_train_matrix=args.precomputed_matrix,
+        test_activations_path=args.test_activations_path,
+        output_path=args.output_path,
+        rho=args.rho,
+        num_classes=args.num_classes,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        device=args.device,
+        max_test_examples=(args.max_test_examples),
+    )
+
+
+if __name__ == "__main__":
+    cli()

@@ -1,0 +1,12 @@
+_target_: classae.sae.jumprelu.JumpReluSAEConfig
+activation_dim: 768
+dict_size: 16384
+lr: 6e-4
+decay_start: 5000
+dead_feature_threshold: 2_000_000
+sparsity_warmup_steps: 300
+target_l0: 380
+
+
+wandb_name: "jumprelu_${seed}_${sae.dict_size}"
+save_dir: "checkpoints/clip_16384/${sae.wandb_name}"
