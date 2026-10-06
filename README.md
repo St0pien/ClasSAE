@@ -2,7 +2,7 @@
 
 # ClasSAE: Class-Aligned Sparse Autoencoders via Differentiable Feature-Class Affinity
 
-[![Paper](https://img.shields.io/badge/arXiv-XXXX.XXXXX-b31b1b.svg)](https://arxiv.org/abs/XXXX.XXXXX)
+[![Paper](https://img.shields.io/badge/arXiv-2610.04020-b31b1b.svg)](https://arxiv.org/abs/2610.04020)
 [![Python 3.13+](https://img.shields.io/badge/Python-3.13%2B-blue.svg)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.x-ee4c2c.svg)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
